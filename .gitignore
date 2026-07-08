@@ -1,20 +1,30 @@
-# Data and local datasets
+# ==========================================
+# 1. Project Datasets & Local Storage
+# ==========================================
 data/*
 !data/.gitkeep
 
-# Experimental outputs and cache
+# ==========================================
+# 2. Experimental Logs & Artifacts
+# ==========================================
 journal_outputs/*
 !journal_outputs/.gitkeep
-*.csv
-*.tsv
-*.png
-*.jpg
-*.jpeg
 
-# Python runtime environment
+# ==========================================
+# 3. Python Runtime & Virtual Environments
+# ==========================================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .venv/
 env/
+venv/
+ENV/
+
+# ==========================================
+# 4. OS & Environment Secret Files
+# ==========================================
 .env
 .DS_Store
+Thumbs.db

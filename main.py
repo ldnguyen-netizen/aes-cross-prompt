@@ -1,468 +1,582 @@
-# ==============================================================================
-# AES HYBRID PIPELINE FOR CROSS-PROMPT RELIABILITY EVALUATION
-# Architecture: RoBERTa Embeddings + TF-IDF + Linguistic Features + LightGBM
-# ==============================================================================
-
 import os
 import re
-import argparse
 import numpy as np
 import pandas as pd
 import torch
 import textstat
 import shap
-import lightgbm as lgb
 import matplotlib.pyplot as plt
-
 from tqdm import tqdm
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from transformers import AutoTokenizer, AutoModel
+from collections import Counter
 from sklearn.model_selection import KFold
+from scipy.stats import ttest_rel, pearsonr
 from sklearn.metrics import mean_squared_error, cohen_kappa_score
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.svm import SVR
-from scipy.stats import pearsonr
-from transformers import AutoTokenizer, AutoModel
+import lightgbm as lgb
 
-def parse_arguments():
-    """
-    Parses command-line arguments for dynamic system execution,
-    allowing customizable paths and key baseline hyperparameters.
-    """
-    parser = argparse.ArgumentParser(
-        description="Hybrid AES Framework with Cross-Prompt Reliability Evaluation"
-    )
+# ==========================================
+# CONFIGURATION AND GLOBAL CONSTANTS
+# ==========================================
+class PipelineConfig:
+    # Customizable paths (Modify these variables as needed)
+    ASAP_PATH = "data/training_set_rel3.tsv"
+    TEACHER_PATH = "data/teacher_dataset.csv"
+    OUTPUT_DIR = "journal_outputs"
     
-    # Dynamic Path Settings
-    parser.add_argument(
-        "--asap_path", 
-        type=str, 
-        default="data/training_set_rel3.tsv",
-        help="Path to the primary ASAP dataset file (TSV format)"
-    )
-    parser.add_argument(
-        "--teacher_path", 
-        type=str, 
-        default="data/teacher_dataset.csv",
-        help="Path to the external teacher-scored validation dataset (CSV format)"
-    )
-    parser.add_argument(
-        "--output_dir", 
-        type=str, 
-        default="journal_outputs",
-        help="Target directory where evaluation metrics and SHAP visualizations are preserved"
-    )
-    
-    # Core Model Hyperparameters
-    parser.add_argument(
-        "--n_estimators", 
-        type=int, 
-        default=800,
-        help="Number of boosting iterations for LightGBM Regressor"
-    )
-    parser.add_argument(
-        "--learning_rate", 
-        type=float, 
-        default=0.02,
-        help="Shrinkage rate/learning rate for gradient boosting optimization"
-    )
-    parser.add_argument(
-        "--num_leaves", 
-        type=int, 
-        default=128,
-        help="Maximum tree leaves for base learners to control model capacity"
-    )
+    # Model and hardware configurations
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    TRANSFORMER_MODEL = "roberta-base"
+    MAX_LEN = 512
+    BATCH_SIZE = 16
+    NUM_FOLDS = 5
+    LSTM_MAX_VOCAB = 5000
+    LSTM_SEQ_LEN = 200
 
-    return parser.parse_args()
+# Global cache for RoBERTa embeddings to optimize computation runtime
+EMB_CACHE = {}
+
+# Ensure the custom output directory exists
+os.makedirs(PipelineConfig.OUTPUT_DIR, exist_ok=True)
 
 
-class TextDataset(Dataset):
-    """
-    Custom PyTorch Dataset encoder to batch text fields for parallel 
-    Transformer tokenization and feature inference.
-    """
-    def __init__(self, texts, tokenizer, max_len=512):
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+# ==========================================
+# TEXT PREPROCESSING AND DATA LOADING
+# ==========================================
+def clean_text(text):
+    """Removes extra whitespaces and standardizes text to lowercase."""
+    text = str(text).lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    def __len__(self):
-        return len(self.texts)
-
-    def __getitem__(self, idx):
-        text = str(self.texts[idx])
-        inputs = self.tokenizer(
-            text,
-            max_length=self.max_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-        return {
-            "input_ids": inputs["input_ids"].squeeze(0),
-            "attention_mask": inputs["attention_mask"].squeeze(0)
-        }
-
-
-def extract_roberta_embeddings(texts, model_name="roberta-base", batch_size=16, device="cpu"):
-    """
-    Extracts high-dimensional dense semantic vectors (768-dim) from the mean-pooled 
-    final hidden states of pre-trained RoBERTa architectures.
-    """
-    print(f"Extracting contextual semantic representations via {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-
-    dataset = TextDataset(texts, tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    embeddings = []
-
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Transformer Inference Inference"):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+def load_asap_dataset():
+    """Loads the ASAP dataset using multiple common encodings to prevent decoding errors."""
+    encodings = ["utf-8", "latin1", "cp1252"]
+    df = None
+    for enc in encodings:
+        try:
+            df = pd.read_csv(PipelineConfig.ASAP_PATH, sep="\t", encoding=enc)
+            print(f"Successfully loaded ASAP dataset with encoding: {enc}")
+            break
+        except Exception:
+            pass
             
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # Apply mean pooling over the sequence dimension to preserve context
-            last_hidden = outputs.last_hidden_state
-            mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
-            sum_embeddings = torch.sum(last_hidden * mask_expanded, 1)
-            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-            mean_pooled = sum_embeddings / sum_mask
-            
-            embeddings.append(mean_pooled.cpu().numpy())
+    if df is None:
+        raise FileNotFoundError(f"Unable to read file at {PipelineConfig.ASAP_PATH}")
+        
+    df = df[["essay", "domain1_score", "essay_set"]].dropna()
+    df["domain1_score"] = df["domain1_score"].astype(float)
+    print(f"Total dataset size: {df.shape}")
+    return df
 
-    return np.vstack(embeddings)
+def normalize_scores(df):
+    """Normalizes scores to a 0-1 range locally within each specific essay set."""
+    df = df.copy()
+    for prompt_id in df["essay_set"].unique():
+        mask = df["essay_set"] == prompt_id
+        scores = df.loc[mask, "domain1_score"]
+        score_range = scores.max() - scores.min()
+        if score_range == 0:
+            df.loc[mask, "domain1_score"] = 0
+        else:
+            df.loc[mask, "domain1_score"] = (scores - scores.min()) / score_range
+    return df
 
 
-def extract_linguistic_features(texts):
-    """
-    Computes a comprehensive handcrafted multi-dimensional matrix tracking 
-    syntactic, structural, lexical richness, and readability markers.
-    """
-    print("Computing hand-engineered linguistic and surface-level metrics...")
+# ==========================================
+# FEATURE ENGINEERING EXTRACTION
+# ==========================================
+def extract_linguistic_features(text):
+    """Extracts 6 core surface linguistic and readability attributes."""
+    words = text.split()
+    if len(words) == 0:
+        return [0] * 6
+    return [
+        len(text),
+        len(words),
+        np.mean([len(w) for w in words]),
+        text.count("."),
+        textstat.flesch_reading_ease(text),
+        len(set(words)) / len(words)
+    ]
+
+def build_linguistic_matrix(df):
+    """Iterates over the dataframe to construct a dense linguistic feature matrix."""
     features = []
-    for text in tqdm(texts, desc="Linguistic Feature Engineering"):
-        text_str = str(text)
-        features.append([
-            textstat.flesch_reading_ease(text_str),
-            textstat.flesch_kincaid_grade(text_str),
-            textstat.smog_index(text_str),
-            textstat.coleman_liau_index(text_str),
-            textstat.automated_readability_index(text_str),
-            textstat.dale_chall_readability_score(text_str),
-            textstat.difficult_words(text_str),
-            textstat.linsear_write_formula(text_str),
-            textstat.gunning_fog(text_str),
-            textstat.text_standard(text_str, float_output=True),
-            textstat.lexicon_count(text_str, removepunct=True),
-            textstat.sentence_count(text_str),
-            textstat.char_count(text_str, ignore_spaces=True),
-            textstat.letter_count(text_str, ignore_spaces=True),
-            textstat.polysyllabcount(text_str),
-            textstat.monosyllabcount(text_str),
-            len(re.findall(r'\b\w+\b', text_str.lower())),
-            len(set(re.findall(r'\b\w+\b', text_str.lower()))),
-            len(text_str.split('\n')),
-            sum(1 for c in text_str if c.isupper()),
-            sum(1 for c in text_str if c.isdigit()),
-            len(re.findall(r'[.,!?;:]', text_str))
-        ])
+    for essay in tqdm(df["essay"], desc="Extracting linguistic features"):
+        features.append(extract_linguistic_features(essay))
     return np.array(features)
 
+def compute_roberta_embeddings(texts, tokenizer, encoder_model):
+    """Computes and caches RoBERTa embeddings from the CLS token representation."""
+    global EMB_CACHE
+    cache_key = hash(str(texts))
+    if cache_key in EMB_CACHE:
+        return EMB_CACHE[cache_key]
 
-def compute_qwk(y_true, y_pred, min_rating=0, max_rating=60):
-    """
-    Computes the Quadratic Weighted Kappa (QWK) to quantify scoring agreement.
-    Continuous outputs are rounded into structured integer bounds.
-    """
-    y_pred_rounded = np.clip(np.round(y_pred), min_rating, max_rating).astype(int)
-    y_true_bounded = np.clip(np.round(y_true), min_rating, max_rating).astype(int)
-    return cohen_kappa_score(
-        y_true_bounded, 
-        y_pred_rounded, 
-        weights="quadratic", 
-        labels=list(range(min_rating, max_rating + 1))
+    embeddings_list = []
+    encoder_model.eval()
+    
+    with torch.no_grad():
+        for i in range(0, len(texts), PipelineConfig.BATCH_SIZE):
+            batch_texts = texts[i:i + PipelineConfig.BATCH_SIZE]
+            inputs = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=PipelineConfig.MAX_LEN,
+                return_tensors="pt"
+            ).to(PipelineConfig.DEVICE)
+
+            cls_representations = encoder_model(inputs["input_ids"], inputs["attention_mask"]).cpu().numpy()
+            embeddings_list.append(cls_representations)
+
+    fused_embeddings = np.vstack(embeddings_list)
+    EMB_CACHE[cache_key] = fused_embeddings
+    return fused_embeddings
+
+
+# ==========================================
+# MODEL DEFINITIONS (ROBERTA & BI-LSTM)
+# ==========================================
+class RoBERTaEncoder(nn.Module):
+    """Wrapper model to extract the contextualized CLS token vector from RoBERTa."""
+    def __init__(self):
+        super().__init__()
+        self.model = AutoModel.from_pretrained(PipelineConfig.TRANSFORMER_MODEL)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.model(input_ids, attention_mask=attention_mask)
+        return outputs.last_hidden_state[:, 0, :]
+
+class BidirectionalLSTM(nn.Module):
+    """Bidirectional LSTM model architecture for semantic sequential modeling."""
+    def __init__(self, vocab_size=5000, embed_dim=128, hidden_dim=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        _, (h, _) = self.lstm(x)
+        h_forward = h[-2]
+        h_backward = h[-1]
+        h_combined = torch.cat((h_forward, h_backward), dim=1)
+        return self.fc(h_combined).squeeze()
+
+
+# ==========================================
+# RECURRENT MODEL MODEL TRAINING UTILS
+# ==========================================
+def build_vocab(texts, max_vocab=5000):
+    counter = Counter()
+    for t in texts:
+        counter.update(t.split())
+    vocab = {"<PAD>": 0, "<UNK>": 1}
+    for i, (w, _) in enumerate(counter.most_common(max_vocab - 2)):
+        vocab[w] = i + 2
+    return vocab
+
+def encode_texts(texts, vocab, max_len=200):
+    encoded_sequences = []
+    for t in texts:
+        seq = [vocab.get(w, 1) for w in t.split()[:max_len]]
+        if len(seq) < max_len:
+            seq += [0] * (max_len - len(seq))
+        encoded_sequences.append(seq)
+    return np.array(encoded_sequences)
+
+def train_lstm_baseline(train_text, y_train, test_text, epochs=10):
+    """Trains a Bidirectional LSTM network baseline model."""
+    vocab = build_vocab(train_text, max_vocab=PipelineConfig.LSTM_MAX_VOCAB)
+    X_train = encode_texts(train_text, vocab, max_len=PipelineConfig.LSTM_SEQ_LEN)
+    X_test = encode_texts(test_text, vocab, max_len=PipelineConfig.LSTM_SEQ_LEN)
+
+    X_train_tensor = torch.tensor(X_train, dtype=torch.long)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.long)
+
+    train_loader = DataLoader(
+        TensorDataset(X_train_tensor, y_train_tensor),
+        batch_size=32,
+        shuffle=True
     )
 
+    model = BidirectionalLSTM(vocab_size=len(vocab)).to(PipelineConfig.DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+    loss_fn = nn.SmoothL1Loss()
 
-def execute_cross_validation(X_full, y, args):
-    """
-    Executes a structured out-of-sample 5-fold cross-validation routine 
-    contrasting Ridge, SVR, and the proposed hybrid LightGBM models.
-    """
-    print("\n--- Initializing Out-of-Sample 5-Fold Cross-Validation ---")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    cv_records = []
+    model.train()
+    for ep in range(epochs):
+        for xb, yb in train_loader:
+            xb, yb = xb.to(PipelineConfig.DEVICE), yb.to(PipelineConfig.DEVICE)
+            optimizer.zero_grad()
+            predictions = model(xb)
+            loss = loss_fn(predictions, yb)
+            loss.backward()
+            optimizer.step()
 
-    for fold, (train_idx, test_idx) in enumerate(kf.split(X_full, y)):
-        X_train, X_test = X_full[train_idx], X_full[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+    model.eval()
+    predictions_list = []
+    with torch.no_grad():
+        for i in range(0, len(X_test_tensor), 64):
+            xb = X_test_tensor[i:i + 64].to(PipelineConfig.DEVICE)
+            pred = model(xb).squeeze().cpu().numpy()
+            if pred.ndim == 0:
+                predictions_list.append(float(pred))
+            else:
+                predictions_list.extend(pred)
 
-        # Baseline 1: Linear Ridge Regression
-        ridge = Ridge(alpha=1.0)
-        ridge.fit(X_train, y_train)
-        preds_ridge = ridge.predict(X_test)
-        qwk_ridge = compute_qwk(y_test, preds_ridge)
+    return np.clip(np.array(predictions_list), 0, 1)
 
-        # Baseline 2: Support Vector Regression (SVR)
-        svr = SVR(C=1.0, epsilon=0.1)
-        svr.fit(X_train, y_train)
-        preds_svr = svr.predict(X_test)
-        qwk_svr = compute_qwk(y_test, preds_svr)
 
-        # Proposed: Highly Regularized LightGBM Regressor Framework
-        lgb_model = lgb.LGBMRegressor(
-            n_estimators=args.n_estimators,
-            learning_rate=args.learning_rate,
-            num_leaves=args.num_leaves,
+# ==========================================
+# EVALUATION METRICS AND STANDARDS
+# ==========================================
+def rescale_predictions(y):
+    """Clips and project normalized scores back onto the unified 12-point scaling system."""
+    y = np.clip(y, 0, 1)
+    return np.round(y * 12)
+
+def evaluate_metrics(y_true, y_pred):
+    """Computes RMSE, Pearson Correlation Coefficient, and Quadratic Weighted Kappa."""
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    pearson_coef = pearsonr(y_true, y_pred)[0]
+
+    y_true_discrete = rescale_predictions(y_true)
+    y_pred_discrete = rescale_predictions(y_pred)
+
+    qwk = cohen_kappa_score(y_true_discrete, y_pred_discrete, weights="quadratic")
+    return rmse, pearson_coef, qwk
+
+
+# ==========================================
+# BASELINE TRADITIONAL MODELS
+# ==========================================
+def run_baseline_ridge(train_text, y_train, test_text):
+    tfidf = TfidfVectorizer(max_features=5000)
+    X_train = tfidf.fit_transform(train_text)
+    X_test = tfidf.transform(test_text)
+    model = Ridge()
+    model.fit(X_train, y_train)
+    return model.predict(X_test)
+
+def run_baseline_svr(train_text, y_train, test_text):
+    tfidf = TfidfVectorizer(max_features=5000)
+    X_train = tfidf.fit_transform(train_text)
+    X_test = tfidf.transform(test_text)
+    model = SVR()
+    model.fit(X_train, y_train)
+    return model.predict(X_test)
+
+
+# ==========================================
+# CORE HYBRID COUPLING PIPELINE
+# ==========================================
+def train_hybrid_framework(train_text, test_text, train_emb, test_emb, train_ling, test_ling, y_train):
+    """Executes feature concatenation and trains the master LightGBM framework."""
+    tfidf = TfidfVectorizer(max_features=5000)
+    X_train_tfidf = tfidf.fit_transform(train_text).toarray()
+    X_test_tfidf = tfidf.transform(test_text).toarray()
+
+    X_train_fused = np.concatenate([train_emb, X_train_tfidf, train_ling], axis=1)
+    X_test_fused = np.concatenate([test_emb, X_test_tfidf, test_ling], axis=1)
+
+    model = lgb.LGBMRegressor(
+        n_estimators=800,
+        learning_rate=0.02,
+        num_leaves=128,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=-1,
+        force_col_wise=True
+    )
+    model.fit(X_train_fused, y_train)
+    predictions = model.predict(X_test_fused)
+    return model, predictions
+
+
+# ==========================================
+# DEEPER COMPREHENSIVE STUDIES
+# ==========================================
+def execute_prompt_wise_lopo(df, linguistic_matrix, tokenizer, encoder_model):
+    """Evaluates cross-prompt generalization using Leave-One-Prompt-Out validation."""
+    print("Executing Leave-One-Prompt-Out cross-prompt validation protocol")
+    results_records = []
+    unique_prompts = sorted(df["essay_set"].unique())
+
+    for current_prompt in unique_prompts:
+        print(f"Holding out Prompt Set: {current_prompt}")
+        train_split = df[df["essay_set"] != current_prompt].copy()
+        test_split = df[df["essay_set"] == current_prompt].copy()
+
+        train_indices = train_split.index.values
+        test_indices = test_split.index.values
+
+        emb_train = compute_roberta_embeddings(train_split["essay"].tolist(), tokenizer, encoder_model)
+        emb_test = compute_roberta_embeddings(test_split["essay"].tolist(), tokenizer, encoder_model)
+
+        tfidf = TfidfVectorizer(max_features=5000)
+        X_train_tfidf = tfidf.fit_transform(train_split["essay"]).toarray()
+        X_test_tfidf = tfidf.transform(test_split["essay"]).toarray()
+
+        X_train = np.concatenate([emb_train, X_train_tfidf, linguistic_matrix[train_indices]], axis=1)
+        X_test = np.concatenate([emb_test, X_test_tfidf, linguistic_matrix[test_indices]], axis=1)
+
+        model = lgb.LGBMRegressor(
+            n_estimators=800,
+            learning_rate=0.02,
+            num_leaves=128,
             n_jobs=-1,
-            random_state=42,
-            verbose=-1
+            force_col_wise=True
         )
-        lgb_model.fit(X_train, y_train)
-        preds_hybrid = lgb_model.predict(X_test)
-        qwk_hybrid = compute_qwk(y_test, preds_hybrid)
+        model.fit(X_train, train_split["domain1_score"].values)
+        preds = model.predict(X_test)
 
-        cv_records.append({
+        rmse, pearson, qwk = evaluate_metrics(test_split["domain1_score"].values, preds)
+        results_records.append({
+            "Prompt": current_prompt,
+            "RMSE": rmse,
+            "Pearson": pearson,
+            "QWK": qwk
+        })
+
+    prompt_table = pd.DataFrame(results_records)
+    prompt_table.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "prompt_results.csv"), index=False)
+    print(prompt_table)
+
+def execute_ablation_study(df, linguistic_matrix, tokenizer, encoder_model):
+    """Runs systematic ablation checks using K-Fold cross validation splits."""
+    print("Initiating component ablation study configuration loops")
+    y_labels = df["domain1_score"].values
+    kf = KFold(n_splits=PipelineConfig.NUM_FOLDS, shuffle=True, random_state=42)
+
+    experimental_configs = {
+        "FULL": (True, True, True),
+        "NO_EMB": (False, True, True),
+        "NO_TFIDF": (True, False, True),
+        "NO_LING": (True, True, False),
+    }
+    ablation_records = []
+
+    for name, (flag_emb, flag_tfidf, flag_ling) in experimental_configs.items():
+        print(f"Processing structural variant: {name}")
+        qwk_list, rmse_list, pearson_list = [], [], []
+
+        for train_idx, test_idx in kf.split(df):
+            train_text = df["essay"].iloc[train_idx]
+            test_text = df["essay"].iloc[test_idx]
+
+            y_train, y_test = y_labels[train_idx], y_labels[test_idx]
+            X_train_blocks, X_test_blocks = [], []
+
+            if flag_emb:
+                X_train_blocks.append(compute_roberta_embeddings(train_text.tolist(), tokenizer, encoder_model))
+                X_test_blocks.append(compute_roberta_embeddings(test_text.tolist(), tokenizer, encoder_model))
+
+            if flag_tfidf:
+                tfidf = TfidfVectorizer(max_features=5000)
+                X_train_blocks.append(tfidf.fit_transform(train_text).toarray())
+                X_test_blocks.append(tfidf.transform(test_text).toarray())
+
+            if flag_ling:
+                X_train_blocks.append(linguistic_matrix[train_idx])
+                X_test_blocks.append(linguistic_matrix[test_idx])
+
+            X_train = np.concatenate(X_train_blocks, axis=1)
+            X_test = np.concatenate(X_test_blocks, axis=1)
+
+            model = lgb.LGBMRegressor(
+                n_estimators=800,
+                learning_rate=0.02,
+                num_leaves=128,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=-1,
+                random_state=42,
+                force_col_wise=True
+            )
+            model.fit(X_train, y_train)
+            predictions = model.predict(X_test)
+
+            rmse, pearson, qwk = evaluate_metrics(y_test, predictions)
+            rmse_list.append(rmse)
+            pearson_list.append(pearson)
+            qwk_list.append(qwk)
+
+        ablation_records.append({
+            "Model": name,
+            "RMSE_mean": np.mean(rmse_list),
+            "Pearson_mean": np.mean(pearson_list),
+            "QWK_mean": np.mean(qwk_list),
+            "QWK_std": np.std(qwk_list)
+        })
+
+    ablation_table = pd.DataFrame(ablation_records)
+    ablation_table.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "ablation_results.csv"), index=False)
+    print(ablation_table)
+
+def draw_structural_architecture():
+    """Generates and saves the pipeline architectural layout graph."""
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.axis("off")
+    processing_steps = [
+        "Essay Text", "Text Cleaning", "RoBERTa Encoder",
+        "TF-IDF Features", "Linguistic Features", "Feature Fusion",
+        "LightGBM", "Score Prediction"
+    ]
+    y_coordinates = np.linspace(0.9, 0.1, len(processing_steps))
+
+    for i, step_text in enumerate(processing_steps):
+        ax.text(
+            0.5, y_coordinates[i], step_text,
+            ha="center", va="center", fontsize=11,
+            bbox=dict(boxstyle="round,pad=0.4", fc="lightblue", ec="black")
+        )
+        if i < len(processing_steps) - 1:
+            ax.arrow(
+                0.5, y_coordinates[i] - 0.05, 0, -0.07,
+                head_width=0.02, length_includes_head=True
+            )
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "architecture.png"), dpi=300)
+    plt.close()
+
+
+# ==========================================
+# MAIN EXECUTABLE FLOW CONTROL
+# ==========================================
+def main():
+    # 1. Load and prepare baseline training parameters
+    df_raw = load_asap_dataset()
+    df_raw["essay"] = df_raw["essay"].apply(clean_text)
+    df_normalized = normalize_scores(df_raw)
+
+    y_labels = df_normalized["domain1_score"].values
+    linguistic_matrix = build_linguistic_matrix(df_normalized)
+
+    tokenizer = AutoTokenizer.from_pretrained(PipelineConfig.TRANSFORMER_MODEL)
+    encoder_model = RoBERTaEncoder().to(PipelineConfig.DEVICE)
+
+    kf = KFold(n_splits=PipelineConfig.NUM_FOLDS, shuffle=True, random_state=42)
+    cross_val_records = []
+
+    # 2. Main cross-validation evaluation loop
+    for fold, (train_idx, test_idx) in enumerate(kf.split(df_normalized)):
+        torch.cuda.empty_cache()
+        EMB_CACHE.clear()
+        print(f"Executing Cross-Validation Partition Fold: {fold + 1}")
+
+        train_texts = df_normalized["essay"].iloc[train_idx]
+        test_texts = df_normalized["essay"].iloc[test_idx]
+        y_train, y_test = y_labels[train_idx], y_labels[test_idx]
+
+        # Benchmarking baseline executions
+        ridge_preds = run_baseline_ridge(train_texts, y_train, test_texts)
+        _, _, qwk_ridge = evaluate_metrics(y_test, ridge_preds)
+
+        svr_preds = run_baseline_svr(train_texts, y_train, test_texts)
+        _, _, qwk_svr = evaluate_metrics(y_test, svr_preds)
+
+        lstm_preds = train_lstm_baseline(train_texts.tolist(), y_train, test_texts.tolist())
+        _, _, qwk_lstm = evaluate_metrics(y_test, lstm_preds)
+
+        # Processing target coupled pipeline execution
+        emb_train = compute_roberta_embeddings(train_texts.tolist(), tokenizer, encoder_model)
+        emb_test = compute_roberta_embeddings(test_texts.tolist(), tokenizer, encoder_model)
+
+        _, hybrid_preds = train_hybrid_framework(
+            train_texts, test_texts, emb_train, emb_test,
+            linguistic_matrix[train_idx], linguistic_matrix[test_idx], y_train
+        )
+        _, _, qwk_hybrid = evaluate_metrics(y_test, hybrid_preds)
+
+        cross_val_records.append({
             "Fold": fold + 1,
             "Ridge_QWK": qwk_ridge,
             "SVR_QWK": qwk_svr,
+            "LSTM_QWK": qwk_lstm,
             "Hybrid_QWK": qwk_hybrid
         })
-        print(f"Fold {fold+1} Completed | Ridge: {qwk_ridge:.4f} | SVR: {qwk_svr:.4f} | Hybrid: {qwk_hybrid:.4f}")
 
-    df_cv = pd.DataFrame(cv_records)
-    df_cv.to_csv(os.path.join(args.output_dir, "cv_results.csv"), index=False)
-    print("Cross-Validation results saved successfully.")
+    cv_results_df = pd.DataFrame(cross_val_records)
+    cv_results_df.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "cv_results.csv"), index=False)
+    print(cv_results_df)
 
+    # 3. Statistical hypothesis testing (T-Test)
+    print("Performing directional relative paired T-Test evaluations")
+    for column_name in ["Ridge_QWK", "SVR_QWK", "LSTM_QWK"]:
+        t_stat, p_val = ttest_rel(cv_results_df["Hybrid_QWK"], cv_results_df[column_name])
+        print(f"Hybrid vs {column_name.split('_')[0]}: t-statistic = {t_stat:.4f}, p-value = {p_val:.6f}")
 
-def execute_ablation_study(emb, tfidf_mat, ling, y, args):
-    """
-    Evaluates In-Sample Representation Capacity across localized feature spaces 
-    to empirically map upper-bound performance thresholds.
-    """
-    print("\n--- Commencing In-Sample Ablation Assessment ---")
-    experiments = {
-        "Lexical_Space_Only_(TFIDF)": tfidf_mat,
-        "Semantic_Space_Only_(RoBERTa)": emb,
-        "Linguistic_Space_Only_(Textstat)": ling,
-        "Unified_MultiTier_Fusion_Space": np.hstack([emb, tfidf_mat, ling])
-    }
+    # 4. Global target structural adaptation processing
+    global_tfidf_vectorizer = TfidfVectorizer(max_features=5000)
+    X_full_corpus_tfidf = global_tfidf_vectorizer.fit_transform(df_normalized["essay"]).toarray()
+    full_corpus_embeddings = compute_roberta_embeddings(df_normalized["essay"].tolist(), tokenizer, encoder_model)
+    X_fully_fused_features = np.concatenate([full_corpus_embeddings, X_full_corpus_tfidf, linguistic_matrix], axis=1)
 
-    ablation_records = []
-    for name, feature_space in experiments.items():
-        lgb_model = lgb.LGBMRegressor(
-            n_estimators=args.n_estimators,
-            learning_rate=args.learning_rate,
-            num_leaves=args.num_leaves,
-            n_jobs=-1,
-            random_state=42,
-            verbose=-1
-        )
-        lgb_model.fit(feature_space, y)
-        preds = lgb_model.predict(feature_space)
-        
-        qwk_score = compute_qwk(y, preds)
-        mse_score = mean_squared_error(y, preds)
-        
-        ablation_records.append({
-            "Feature_Configuration": name,
-            "InSample_MSE": mse_score,
-            "InSample_QWK": qwk_score
-        })
-        print(f"Config: {name} | QWK Upper-bound: {qwk_score:.4f}")
-
-    df_ablation = pd.DataFrame(ablation_records)
-    df_ablation.to_csv(os.path.join(args.output_dir, "ablation_study.csv"), index=False)
-    print("Ablation matrix successfully updated.")
-
-
-def execute_prompt_wise_evaluation(df, emb, tfidf_mat, ling, args):
-    """
-    Isolates predictive boundaries within discrete prompt limitations to resolve
-    structural variance issues and evaluate local reliability constraints.
-    """
-    print("\n--- Executing Isolated Prompt-Wise Performance Audit ---")
-    prompt_records = []
-    unique_prompts = sorted(df["essay_set"].unique())
-
-    for prompt_id in unique_prompts:
-        indices = df[df["essay_set"] == prompt_id].index.tolist()
-        
-        # Sub-sample localized segments
-        y_prompt = df.loc[indices, "normalized_score"].values
-        emb_p = emb[indices]
-        tfidf_p = tfidf_mat[indices]
-        ling_p = ling[indices]
-        X_p = np.hstack([emb_p, tfidf_p, ling_p])
-
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        p_preds = np.zeros(len(indices))
-
-        for train_idx, test_idx in kf.split(X_p, y_prompt):
-            lgb_model = lgb.LGBMRegressor(
-                n_estimators=args.n_estimators,
-                learning_rate=args.learning_rate,
-                num_leaves=args.num_leaves,
-                n_jobs=-1,
-                random_state=42,
-                verbose=-1
-            )
-            lgb_model.fit(X_p[train_idx], y_prompt[train_idx])
-            p_preds[test_idx] = lgb_model.predict(X_p[test_idx])
-
-        rmse = np.sqrt(mean_squared_error(y_prompt, p_preds))
-        pearson_r, _ = pearsonr(y_prompt, p_preds)
-        qwk = compute_qwk(y_prompt, p_preds)
-
-        prompt_records.append({
-            "Prompt": prompt_id,
-            "RMSE": rmse,
-            "Pearson_r": pearson_r,
-            "QWK": qwk
-        })
-        print(f"Prompt {prompt_id} Framework Evaluation -> RMSE: {rmse:.4f}, Pearson: {pearson_r:.4f}, QWK: {qwk:.4f}")
-
-    df_prompt = pd.DataFrame(prompt_records)
-    df_prompt.to_csv(os.path.join(args.output_dir, "prompt_results.csv"), index=False)
-    print("Prompt-wise reliability evaluation saved.")
-
-
-def draw_system_architecture(output_path):
-    """
-    Generates a high-resolution, formal system flow diagram for the 
-    Multi-tier Fusion pipeline to resolve manuscript visualization missing issues.
-    """
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.axis("off")
-    
-    box_props = dict(boxstyle="round,pad=0.5", fc="#e1f5fe", ec="#0288d1", lw=1.5)
-    f_props = dict(boxstyle="round,pad=0.4", fc="#e8f5e9", ec="#388e3c", lw=1.2)
-    model_props = dict(boxstyle="round,pad=0.6", fc="#fff3e0", ec="#f57c00", lw=2)
-
-    ax.text(0.1, 0.5, "Input Student\nEssay Text", ha="center", va="center", bbox=box_props, fontsize=11)
-    
-    # Text representations
-    ax.text(0.4, 0.8, "Semantic Layer\n(roBERTa-base Context Embeddings)", ha="center", va="center", bbox=f_props, fontsize=9)
-    ax.text(0.4, 0.5, "Lexical Layer\n(Character/Word TF-IDF Vectors)", ha="center", va="center", bbox=f_props, fontsize=9)
-    ax.text(0.4, 0.2, "Syntactic Layer\n(Textstat Structural Complexity)", ha="center", va="center", bbox=f_props, fontsize=9)
-    
-    ax.text(0.7, 0.5, "Multi-tier\nFeature Fusion\nMatrix Concatenation", ha="center", va="center", bbox=box_props, fontsize=10)
-    ax.text(0.95, 0.5, "Optimized\nLightGBM\nRegressor", ha="center", va="center", bbox=model_props, fontsize=11)
-
-    # Drawing directional vectors
-    arrow = dict(arrowstyle="->", lw=1.5, color="#37474f")
-    ax.annotate("", xy=(0.24, 0.75), xytext=(0.18, 0.55), arrowprops=arrow)
-    ax.annotate("", xy=(0.24, 0.50), xytext=(0.18, 0.50), arrowprops=arrow)
-    ax.annotate("", xy=(0.24, 0.25), xytext=(0.18, 0.45), arrowprops=arrow)
-    
-    ax.annotate("", xy=(0.56, 0.55), xytext=(0.50, 0.75), arrowprops=arrow)
-    ax.annotate("", xy=(0.56, 0.50), xytext=(0.52, 0.50), arrowprops=arrow)
-    ax.annotate("", xy=(0.56, 0.45), xytext=(0.50, 0.25), arrowprops=arrow)
-    
-    ax.annotate("", xy=(0.84, 0.50), xytext=(0.79, 0.50), arrowprops=arrow)
-
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"System architecture block diagram generated at: {output_path}")
-
-
-# ------------------------------------------------------------------------------
-# CORE PIPELINE EXECUTION ENGINE
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    args = parse_arguments()
-    
-    print("====================================================================")
-    print("RUNNING AUTOMATED ESSAY SCORING REPRODUCIBILITY ENGINE")
-    print("====================================================================")
-    print(f"Primary Dataset Target: {args.asap_path}")
-    print(f"Validation Target:      {args.teacher_path}")
-    print(f"Output Vault:           {args.output_dir}")
-    print("====================================================================")
-
-    # Hardware acceleration check
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"System execution assigned to: {DEVICE}")
-
-    # Step 1: Pre-process primary tabular structures
-    if not os.path.exists(args.asap_path):
-        raise FileNotFoundError(f"Missing mandatory ASAP source files at {args.asap_path}")
-        
-    df = pd.read_csv(args.asap_path, sep="\t", encoding="ISO-8859-1")
-    df = df.dropna(subset=["essay", "essay_set", "domain1_score"])
-    df = df.reset_index(drop=True)
-
-    # Normalize localized boundaries to a scale-invariant distribution [0, 1]
-    df["normalized_score"] = 0.0
-    for prompt_id in df["essay_set"].unique():
-        subset = df[df["essay_set"] == prompt_id]
-        min_s = subset["domain1_score"].min()
-        max_s = subset["domain1_score"].max()
-        if max_s > min_s:
-            df.loc[subset.index, "normalized_score"] = (subset["domain1_score"] - min_s) / (max_s - min_s)
-        else:
-            df.loc[subset.index, "normalized_score"] = 1.0
-
-    texts = df["essay"].tolist()
-    y = df["normalized_score"].values
-
-    # Step 2: Multi-tier feature extraction routines
-    emb = extract_roberta_embeddings(texts, model_name="roberta-base", batch_size=16, device=DEVICE)
-    
-    print("Constructing lexical vector spaces using optimized character/word n-grams...")
-    tfidf = TfidfVectorizer(max_features=5000, analyzer="word", ngram_range=(1, 3), stop_words="english")
-    tfidf_mat = tfidf.fit_transform(texts).toarray()
-    
-    ling = extract_linguistic_features(texts)
-
-    # Unified feature space concatenation
-    X_full = np.hstack([emb, tfidf_mat, ling])
-    print(f"Unified input feature space initialization finalized. Target shape: {X_full.shape}")
-
-    # Step 3: Empirical evaluations
-    execute_cross_validation(X_full, y, args)
-    execute_ablation_study(emb, tfidf_mat, ling, y, args)
-    execute_prompt_wise_evaluation(df, emb, tfidf_mat, ling, args)
-
-    # Step 4: Resolve manuscript figure compliance dependencies
-    draw_system_architecture(os.path.join(args.output_dir, "architecture.png"))
-
-    # Step 5: Advanced interpretability modeling via SHAP values
-    print("\n--- Constructing SHAP Model Interpretability Logs ---")
-    final_model = lgb.LGBMRegressor(
-        n_estimators=args.n_estimators,
-        learning_rate=args.learning_rate,
-        num_leaves=args.num_leaves,
-        n_jobs=-1,
-        random_state=42,
-        verbose=-1
+    final_production_model = lgb.LGBMRegressor(
+        n_estimators=800,
+        learning_rate=0.02,
+        num_leaves=128,
+        n_jobs=-1
     )
-    final_model.fit(X_full, y)
+    final_production_model.fit(X_fully_fused_features, y_labels)
 
-    explainer = shap.TreeExplainer(final_model)
-    sample_size = min(1000, len(X_full))
-    sample_data = X_full[:sample_size]
-    shap_values = explainer.shap_values(sample_data)
+    # 5. External dataset inference check
+    if os.path.exists(PipelineConfig.TEACHER_PATH):
+        print("Commencing evaluation protocols on external reference teacher target files")
+        teacher_df = pd.read_csv(PipelineConfig.TEACHER_PATH).dropna(subset=["essay", "level"])
+        teacher_df["essay"] = teacher_df["essay"].apply(clean_text)
 
-    # Export continuous SHAP summary densities
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, sample_data, max_display=20, show=False)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "shap_summary.png"), dpi=300, bbox_inches="tight")
+        X_teacher_tfidf = global_tfidf_vectorizer.transform(teacher_df["essay"]).toarray()
+        emb_teacher = compute_roberta_embeddings(teacher_df["essay"].tolist(), tokenizer, encoder_model)
+        ling_teacher = build_linguistic_matrix(teacher_df)
+        X_teacher_fused = np.concatenate([emb_teacher, X_teacher_tfidf, ling_teacher], axis=1)
+
+        teacher_predictions = np.clip(final_production_model.predict(X_teacher_fused), 0, 1)
+        y_teacher_ground_truth = (teacher_df["level"] - 1) / 2
+
+        rmse_t, pearson_t = np.sqrt(mean_squared_error(y_teacher_ground_truth, teacher_predictions)), pearsonr(y_teacher_ground_truth, teacher_predictions)[0]
+        print(f"Teacher Validation -> RMSE: {rmse_t:.4f}, Pearson: {pearson_t:.4f}")
+
+        best_achieved_qwk = -1
+        for threshold_1 in np.arange(0.2, 0.6, 0.05):
+            for threshold_2 in np.arange(threshold_1 + 0.1, 0.9, 0.05):
+                temp_mapped_labels = np.zeros_like(teacher_predictions, dtype=int)
+                temp_mapped_labels[teacher_predictions < threshold_1] = 1
+                temp_mapped_labels[(teacher_predictions >= threshold_1) & (teacher_predictions < threshold_2)] = 2
+                temp_mapped_labels[teacher_predictions >= threshold_2] = 3
+
+                current_kappa = cohen_kappa_score(teacher_df["level"], temp_mapped_labels, weights="quadratic")
+                if current_kappa > best_achieved_qwk:
+                    best_achieved_qwk = current_kappa
+                    best_t1, best_t2 = threshold_1, threshold_2
+
+        print(f"Optimized Decision Boundaries -> Threshold 1: {best_t1:.2f}, Threshold 2: {best_t2:.2f} | Highest QWK: {best_achieved_qwk:.4f}")
+
+    # 6. Interpretability engineering and graphics export
+    shap_tree_explainer = shap.TreeExplainer(final_production_model)
+    sampled_feature_subset = X_fully_fused_features[:300]
+    calculated_shap_values = shap_tree_explainer.shap_values(sampled_feature_subset)
+
+    shap.summary_plot(calculated_shap_values, sampled_feature_subset, show=False)
+    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "shap_summary.png"))
     plt.close()
 
-    # Export structured SHAP dimensional importance weights
-    plt.figure(figsize=(8, 6))
-    shap.summary_plot(shap_values, sample_data, plot_type="bar", max_display=20, show=False)
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "shap_importance.png"), dpi=300, bbox_inches="tight")
-    plt.close()
+    draw_structural_architecture()
+    execute_prompt_wise_lopo(df_normalized, linguistic_matrix, tokenizer, encoder_model)
+    execute_ablation_study(df_normalized, linguistic_matrix, tokenizer, encoder_model)
+    print("Master pipeline operational execution finished successfully.")
 
-    print("====================================================================")
-    print("PIPELINE EXECUTION CONCLUDED. ALL ARTIFACTS EXPORTED SUCCESSFULLY.")
-    print("====================================================================")
+if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.freeze_support()
+    main()

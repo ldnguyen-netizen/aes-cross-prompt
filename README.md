@@ -9,11 +9,11 @@ The framework introduces a Multi-tier Feature Fusion network engineered to analy
 ## Framework Architecture and Key Components
 
 The system integrates three distinct linguistic representation tiers to construct a comprehensive scoring space:
-1. Semantic Embeddings: High-dimensional contextual vectors extracted via the mean-pooled final hidden states of a pre-trained roBERTa-base encoder (768 dimensions).
-2. Lexical Features: Sparse n-gram frequency distributions captured via a TF-IDF Vectorizer (capped at 5,000 dimensions).
-3. Syntactic and Surface Indicators: 22 fine-grained linguistic and structural metrics computed via the textstat engine (including sentence length statistics, syllable distributions, and standardized readability indices like Flesch-Kincaid).
+1. Semantic Embeddings: High-dimensional contextual vectors extracted via the contextualized CLS token representations of a pre-trained roBERTa-base encoder (768 dimensions).
+2. Lexical Features: Sparse token frequency distributions captured via a TF-IDF Vectorizer (capped at 5,000 dimensions).
+3. Syntactic and Surface Indicators: Core structural and readability metrics computed via the textstat engine (including length statistics, word complexity, and standardized readability indices like Flesch Reading Ease).
 
-The combined feature matrix is optimized and mapped to essay scores utilizing a regularized LightGBM Regressor.
+The combined feature matrix (exactly 5,790 features) is optimized and mapped to essay scores utilizing a regularized LightGBM Regressor.
 
 ---
 
