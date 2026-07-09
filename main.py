@@ -5,56 +5,57 @@ import pandas as pd
 import torch
 import textstat
 import shap
+import lightgbm as lgb
 import matplotlib.pyplot as plt
+
 from tqdm import tqdm
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, TensorDataset
-from transformers import AutoTokenizer, AutoModel
-from collections import Counter
+
 from sklearn.model_selection import KFold
-from scipy.stats import ttest_rel, pearsonr
-from sklearn.metrics import mean_squared_error, cohen_kappa_score
+from sklearn.metrics import mean_squared_error, cohen_kappa_score, confusion_matrix, ConfusionMatrixDisplay
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.svm import SVR
-import lightgbm as lgb
 
-# ==========================================
-# CONFIGURATION AND GLOBAL CONSTANTS
-# ==========================================
+from scipy.stats import pearsonr, ttest_rel
+from collections import Counter
+
+# ============================================================
+# SYSTEM CONFIGURATION AND CONSTANTS
+# ============================================================
 class PipelineConfig:
-    # Customizable paths (Modify these variables as needed)
     ASAP_PATH = "data/training_set_rel3.tsv"
     TEACHER_PATH = "data/teacher_dataset.csv"
     OUTPUT_DIR = "journal_outputs"
     
-    # Model and hardware configurations
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     TRANSFORMER_MODEL = "roberta-base"
+    
     MAX_LEN = 512
     BATCH_SIZE = 16
     NUM_FOLDS = 5
     LSTM_MAX_VOCAB = 5000
     LSTM_SEQ_LEN = 200
 
-# Global cache for RoBERTa embeddings to optimize computation runtime
+# Global cache to preserve computation power during execution iterations
 EMB_CACHE = {}
 
-# Ensure the custom output directory exists
+# Guarantee that the custom production output path exists cleanly
 os.makedirs(PipelineConfig.OUTPUT_DIR, exist_ok=True)
 
 
-# ==========================================
-# TEXT PREPROCESSING AND DATA LOADING
-# ==========================================
+# ============================================================
+# DATA PREPROCESSING AND LOADING
+# ============================================================
 def clean_text(text):
-    """Removes extra whitespaces and standardizes text to lowercase."""
+    """Removes extra whitespaces and maps text to lowercase."""
     text = str(text).lower()
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 def load_asap_dataset():
-    """Loads the ASAP dataset using multiple common encodings to prevent decoding errors."""
+    """Loads the ASAP dataset robustly across multiple standard encodings."""
     encodings = ["utf-8", "latin1", "cp1252"]
     df = None
     for enc in encodings:
@@ -66,15 +67,15 @@ def load_asap_dataset():
             pass
             
     if df is None:
-        raise FileNotFoundError(f"Unable to read file at {PipelineConfig.ASAP_PATH}")
+        raise FileNotFoundError(f"Unable to read reference target file at {PipelineConfig.ASAP_PATH}")
         
     df = df[["essay", "domain1_score", "essay_set"]].dropna()
     df["domain1_score"] = df["domain1_score"].astype(float)
-    print(f"Total dataset size: {df.shape}")
+    print(f"Total production dataset shape size: {df.shape}")
     return df
 
 def normalize_scores(df):
-    """Normalizes scores to a 0-1 range locally within each specific essay set."""
+    """Normalizes scores locally [0, 1] within each native essay prompt context."""
     df = df.copy()
     for prompt_id in df["essay_set"].unique():
         mask = df["essay_set"] == prompt_id
@@ -87,11 +88,11 @@ def normalize_scores(df):
     return df
 
 
-# ==========================================
-# FEATURE ENGINEERING EXTRACTION
-# ==========================================
+# ============================================================
+# MULTI-TIER FEATURE ENGINEERING EXTRACTION
+# ============================================================
 def extract_linguistic_features(text):
-    """Extracts 6 core surface linguistic and readability attributes."""
+    """Extracts exactly 6 surface linguistic and readability attributes."""
     words = text.split()
     if len(words) == 0:
         return [0] * 6
@@ -101,18 +102,18 @@ def extract_linguistic_features(text):
         np.mean([len(w) for w in words]),
         text.count("."),
         textstat.flesch_reading_ease(text),
-        len(set(words)) / len(words)
+        len(set(words)) / len(words)  # Type-Token Ratio
     ]
 
 def build_linguistic_matrix(df):
-    """Iterates over the dataframe to construct a dense linguistic feature matrix."""
+    """Iterates seamlessly over the dataframe to construct the dense linguistic feature space."""
     features = []
     for essay in tqdm(df["essay"], desc="Extracting linguistic features"):
         features.append(extract_linguistic_features(essay))
     return np.array(features)
 
 def compute_roberta_embeddings(texts, tokenizer, encoder_model):
-    """Computes and caches RoBERTa embeddings from the CLS token representation."""
+    """Extracts 768-dim semantic representations from the pre-trained CLS token vector."""
     global EMB_CACHE
     cache_key = hash(str(texts))
     if cache_key in EMB_CACHE:
@@ -140,11 +141,11 @@ def compute_roberta_embeddings(texts, tokenizer, encoder_model):
     return fused_embeddings
 
 
-# ==========================================
-# MODEL DEFINITIONS (ROBERTA & BI-LSTM)
-# ==========================================
+# ============================================================
+# DEEP LEARNING COMPONENT WRAPPERS
+# ============================================================
 class RoBERTaEncoder(nn.Module):
-    """Wrapper model to extract the contextualized CLS token vector from RoBERTa."""
+    """Extracts contextual embeddings from the final layer hidden states."""
     def __init__(self):
         super().__init__()
         self.model = AutoModel.from_pretrained(PipelineConfig.TRANSFORMER_MODEL)
@@ -154,7 +155,7 @@ class RoBERTaEncoder(nn.Module):
         return outputs.last_hidden_state[:, 0, :]
 
 class BidirectionalLSTM(nn.Module):
-    """Bidirectional LSTM model architecture for semantic sequential modeling."""
+    """Recurrent baseline sequential network processing configuration."""
     def __init__(self, vocab_size=5000, embed_dim=128, hidden_dim=128):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
@@ -171,9 +172,9 @@ class BidirectionalLSTM(nn.Module):
         return self.fc(h_combined).squeeze()
 
 
-# ==========================================
-# RECURRENT MODEL MODEL TRAINING UTILS
-# ==========================================
+# ============================================================
+# BASELINE RECURRENT MODEL TRAINING INFRASTRUCTURE
+# ============================================================
 def build_vocab(texts, max_vocab=5000):
     counter = Counter()
     for t in texts:
@@ -193,7 +194,7 @@ def encode_texts(texts, vocab, max_len=200):
     return np.array(encoded_sequences)
 
 def train_lstm_baseline(train_text, y_train, test_text, epochs=10):
-    """Trains a Bidirectional LSTM network baseline model."""
+    """Trains the baseline deep sequential network explicitly matching specified hyperparameters."""
     vocab = build_vocab(train_text, max_vocab=PipelineConfig.LSTM_MAX_VOCAB)
     X_train = encode_texts(train_text, vocab, max_len=PipelineConfig.LSTM_SEQ_LEN)
     X_test = encode_texts(test_text, vocab, max_len=PipelineConfig.LSTM_SEQ_LEN)
@@ -236,16 +237,16 @@ def train_lstm_baseline(train_text, y_train, test_text, epochs=10):
     return np.clip(np.array(predictions_list), 0, 1)
 
 
-# ==========================================
-# EVALUATION METRICS AND STANDARDS
-# ==========================================
+# ============================================================
+# PERFORMANCE EVALUATION STANDARDS
+# ============================================================
 def rescale_predictions(y):
-    """Clips and project normalized scores back onto the unified 12-point scaling system."""
+    """Rescales normalized outputs [0, 1] onto the native discrete 12-point scaling matrix."""
     y = np.clip(y, 0, 1)
     return np.round(y * 12)
 
 def evaluate_metrics(y_true, y_pred):
-    """Computes RMSE, Pearson Correlation Coefficient, and Quadratic Weighted Kappa."""
+    """Computes exact RMSE, Pearson Correlation, and Quadratic Weighted Kappa."""
     rmse = np.sqrt(mean_squared_error(y_true, y_pred))
     pearson_coef = pearsonr(y_true, y_pred)[0]
 
@@ -256,9 +257,9 @@ def evaluate_metrics(y_true, y_pred):
     return rmse, pearson_coef, qwk
 
 
-# ==========================================
-# BASELINE TRADITIONAL MODELS
-# ==========================================
+# ============================================================
+# TRADITIONAL SHALLOW MODEL BASELINES
+# ============================================================
 def run_baseline_ridge(train_text, y_train, test_text):
     tfidf = TfidfVectorizer(max_features=5000)
     X_train = tfidf.fit_transform(train_text)
@@ -276,11 +277,11 @@ def run_baseline_svr(train_text, y_train, test_text):
     return model.predict(X_test)
 
 
-# ==========================================
-# CORE HYBRID COUPLING PIPELINE
-# ==========================================
+# ============================================================
+# TARGET HYBRID INTEGRATED FRAMEWORK
+# ============================================================
 def train_hybrid_framework(train_text, test_text, train_emb, test_emb, train_ling, test_ling, y_train):
-    """Executes feature concatenation and trains the master LightGBM framework."""
+    """Executes multi-tier feature concatenation and optimizes LightGBM Regressor configurations."""
     tfidf = TfidfVectorizer(max_features=5000)
     X_train_tfidf = tfidf.fit_transform(train_text).toarray()
     X_test_tfidf = tfidf.transform(test_text).toarray()
@@ -302,11 +303,11 @@ def train_hybrid_framework(train_text, test_text, train_emb, test_emb, train_lin
     return model, predictions
 
 
-# ==========================================
-# DEEPER COMPREHENSIVE STUDIES
-# ==========================================
+# ============================================================
+# CROSS-PROMPT STUDIES & COMPONENT ABLATION LOOPS
+# ============================================================
 def execute_prompt_wise_lopo(df, linguistic_matrix, tokenizer, encoder_model):
-    """Evaluates cross-prompt generalization using Leave-One-Prompt-Out validation."""
+    """Executes structural Leave-One-Prompt-Out validation mapping outputs to prompt_results.csv."""
     print("Executing Leave-One-Prompt-Out cross-prompt validation protocol")
     results_records = []
     unique_prompts = sorted(df["essay_set"].unique())
@@ -349,11 +350,12 @@ def execute_prompt_wise_lopo(df, linguistic_matrix, tokenizer, encoder_model):
 
     prompt_table = pd.DataFrame(results_records)
     prompt_table.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "prompt_results.csv"), index=False)
+    print("\n--- Leave-One-Prompt-Out (LOPO) Cross-Prompt Results ---")
     print(prompt_table)
 
 def execute_ablation_study(df, linguistic_matrix, tokenizer, encoder_model):
-    """Runs systematic ablation checks using K-Fold cross validation splits."""
-    print("Initiating component ablation study configuration loops")
+    """Runs structural verification sequences mapping outputs to ablation_results.csv."""
+    print("Initiating system configuration ablation loops")
     y_labels = df["domain1_score"].values
     kf = KFold(n_splits=PipelineConfig.NUM_FOLDS, shuffle=True, random_state=42)
 
@@ -366,7 +368,7 @@ def execute_ablation_study(df, linguistic_matrix, tokenizer, encoder_model):
     ablation_records = []
 
     for name, (flag_emb, flag_tfidf, flag_ling) in experimental_configs.items():
-        print(f"Processing structural variant: {name}")
+        print(f"Processing architectural configuration layout: {name}")
         qwk_list, rmse_list, pearson_list = [], [], []
 
         for train_idx, test_idx in kf.split(df):
@@ -420,41 +422,15 @@ def execute_ablation_study(df, linguistic_matrix, tokenizer, encoder_model):
 
     ablation_table = pd.DataFrame(ablation_records)
     ablation_table.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "ablation_results.csv"), index=False)
+    print("\n--- Component Ablation Study Analysis ---")
     print(ablation_table)
 
-def draw_structural_architecture():
-    """Generates and saves the pipeline architectural layout graph."""
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.axis("off")
-    processing_steps = [
-        "Essay Text", "Text Cleaning", "RoBERTa Encoder",
-        "TF-IDF Features", "Linguistic Features", "Feature Fusion",
-        "LightGBM", "Score Prediction"
-    ]
-    y_coordinates = np.linspace(0.9, 0.1, len(processing_steps))
 
-    for i, step_text in enumerate(processing_steps):
-        ax.text(
-            0.5, y_coordinates[i], step_text,
-            ha="center", va="center", fontsize=11,
-            bbox=dict(boxstyle="round,pad=0.4", fc="lightblue", ec="black")
-        )
-        if i < len(processing_steps) - 1:
-            ax.arrow(
-                0.5, y_coordinates[i] - 0.05, 0, -0.07,
-                head_width=0.02, length_includes_head=True
-            )
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "architecture.png"), dpi=300)
-    plt.close()
-
-
-# ==========================================
-# MAIN EXECUTABLE FLOW CONTROL
-# ==========================================
+# ============================================================
+# MAIN PIPELINE WORKFLOW EXECUTION
+# ============================================================
 def main():
-    # 1. Load and prepare baseline training parameters
+    # 1. Processing dataset loading sequences
     df_raw = load_asap_dataset()
     df_raw["essay"] = df_raw["essay"].apply(clean_text)
     df_normalized = normalize_scores(df_raw)
@@ -468,7 +444,7 @@ def main():
     kf = KFold(n_splits=PipelineConfig.NUM_FOLDS, shuffle=True, random_state=42)
     cross_val_records = []
 
-    # 2. Main cross-validation evaluation loop
+    # 2. Main cross-validation evaluation sequencing loops
     for fold, (train_idx, test_idx) in enumerate(kf.split(df_normalized)):
         torch.cuda.empty_cache()
         EMB_CACHE.clear()
@@ -478,7 +454,7 @@ def main():
         test_texts = df_normalized["essay"].iloc[test_idx]
         y_train, y_test = y_labels[train_idx], y_labels[test_idx]
 
-        # Benchmarking baseline executions
+        # Benchmarking traditional architectures
         ridge_preds = run_baseline_ridge(train_texts, y_train, test_texts)
         _, _, qwk_ridge = evaluate_metrics(y_test, ridge_preds)
 
@@ -488,7 +464,7 @@ def main():
         lstm_preds = train_lstm_baseline(train_texts.tolist(), y_train, test_texts.tolist())
         _, _, qwk_lstm = evaluate_metrics(y_test, lstm_preds)
 
-        # Processing target coupled pipeline execution
+        # Processing fused target framework setup
         emb_train = compute_roberta_embeddings(train_texts.tolist(), tokenizer, encoder_model)
         emb_test = compute_roberta_embeddings(test_texts.tolist(), tokenizer, encoder_model)
 
@@ -508,15 +484,19 @@ def main():
 
     cv_results_df = pd.DataFrame(cross_val_records)
     cv_results_df.to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "cv_results.csv"), index=False)
+    print("\n--- Unified 5-Fold Cross Validation Results ---")
     print(cv_results_df)
 
-    # 3. Statistical hypothesis testing (T-Test)
-    print("Performing directional relative paired T-Test evaluations")
+    # 3. Statistical directional hypothesis pairing (Paired T-Test)
+    print("\n--- Statistical Significance Evaluations (Paired T-Test vs Hybrid) ---")
+    ttest_rows = []
     for column_name in ["Ridge_QWK", "SVR_QWK", "LSTM_QWK"]:
         t_stat, p_val = ttest_rel(cv_results_df["Hybrid_QWK"], cv_results_df[column_name])
         print(f"Hybrid vs {column_name.split('_')[0]}: t-statistic = {t_stat:.4f}, p-value = {p_val:.6f}")
+        ttest_rows.append({"Comparison": f"Hybrid_vs_{column_name.split('_')[0]}", "t_statistic": t_stat, "p_value": p_val})
+    pd.DataFrame(ttest_rows).to_csv(os.path.join(PipelineConfig.OUTPUT_DIR, "ttest_results.csv"), index=False)
 
-    # 4. Global target structural adaptation processing
+    # 4. Global production modeling compilation
     global_tfidf_vectorizer = TfidfVectorizer(max_features=5000)
     X_full_corpus_tfidf = global_tfidf_vectorizer.fit_transform(df_normalized["essay"]).toarray()
     full_corpus_embeddings = compute_roberta_embeddings(df_normalized["essay"].tolist(), tokenizer, encoder_model)
@@ -526,13 +506,14 @@ def main():
         n_estimators=800,
         learning_rate=0.02,
         num_leaves=128,
-        n_jobs=-1
+        n_jobs=-1,
+        force_col_wise=True
     )
     final_production_model.fit(X_fully_fused_features, y_labels)
 
-    # 5. External dataset inference check
+    # 5. External dataset evaluation and Teacher validation matrix export
     if os.path.exists(PipelineConfig.TEACHER_PATH):
-        print("Commencing evaluation protocols on external reference teacher target files")
+        print("\nCommencing comprehensive verification loop execution on external teacher files")
         teacher_df = pd.read_csv(PipelineConfig.TEACHER_PATH).dropna(subset=["essay", "level"])
         teacher_df["essay"] = teacher_df["essay"].apply(clean_text)
 
@@ -545,9 +526,10 @@ def main():
         y_teacher_ground_truth = (teacher_df["level"] - 1) / 2
 
         rmse_t, pearson_t = np.sqrt(mean_squared_error(y_teacher_ground_truth, teacher_predictions)), pearsonr(y_teacher_ground_truth, teacher_predictions)[0]
-        print(f"Teacher Validation -> RMSE: {rmse_t:.4f}, Pearson: {pearson_t:.4f}")
+        print(f"Teacher Validation System -> RMSE: {rmse_t:.4f}, Pearson Correlation: {pearson_t:.4f}")
 
         best_achieved_qwk = -1
+        best_t1, best_t2 = 0.33, 0.66
         for threshold_1 in np.arange(0.2, 0.6, 0.05):
             for threshold_2 in np.arange(threshold_1 + 0.1, 0.9, 0.05):
                 temp_mapped_labels = np.zeros_like(teacher_predictions, dtype=int)
@@ -560,21 +542,73 @@ def main():
                     best_achieved_qwk = current_kappa
                     best_t1, best_t2 = threshold_1, threshold_2
 
-        print(f"Optimized Decision Boundaries -> Threshold 1: {best_t1:.2f}, Threshold 2: {best_t2:.2f} | Highest QWK: {best_achieved_qwk:.4f}")
+        print(f"Optimized Threshold Constraints -> Boundary 1: {best_t1:.2f}, Boundary 2: {best_t2:.2f} | Highest QWK: {best_achieved_qwk:.4f}")
+        
+        # FINAL PLOTTING MAPPED LABELS MIGRATED FROM ORIGIN CODE 1
+        teacher_df["pred_level"] = np.zeros_like(teacher_predictions, dtype=int)
+        teacher_df["pred_level"][teacher_predictions < best_t1] = 1
+        teacher_df["pred_level"][(teacher_predictions >= best_t1) & (teacher_predictions < best_t2)] = 2
+        teacher_df["pred_level"][teacher_predictions >= best_t2] = 3
 
-    # 6. Interpretability engineering and graphics export
+        # Figure 3: Teacher Evaluation Confusion Matrix
+        cm = confusion_matrix(teacher_df["level"], teacher_df["pred_level"])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[1, 2, 3])
+        fig, ax = plt.subplots(figsize=(6, 6))
+        disp.plot(cmap=plt.cm.Blues, ax=ax)
+        plt.title("Teacher Validation Confusion Matrix")
+        plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "teacher_cm.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
+        # Figure 4: Prediction Error Distribution & Error Analysis Export
+        teacher_df["error"] = teacher_df["pred_level"] - teacher_df["level"]
+        teacher_df["abs_error"] = np.abs(teacher_df["error"])
+
+        teacher_df.sort_values("abs_error", ascending=False).head(20).to_csv(
+            os.path.join(PipelineConfig.OUTPUT_DIR, "top_errors.csv"), index=False
+        )
+
+        plt.figure(figsize=(7, 5))
+        plt.hist(teacher_df["error"], bins=np.arange(-3.5, 4.5, 1), edgecolor='black', align='left')
+        plt.title("Prediction Error Distribution")
+        plt.xlabel("Error Vector Score Difference")
+        plt.ylabel("Frequency")
+        plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "error_distribution.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
+        # Supplementary Figure: Essay Length vs Error Distribution Analysis
+        teacher_df["length"] = teacher_df["essay"].apply(lambda x: len(x.split()))
+        plt.figure(figsize=(7, 5))
+        plt.scatter(teacher_df["length"], teacher_df["abs_error"], alpha=0.6)
+        plt.title("Prediction Error vs Essay Length Analysis")
+        plt.xlabel("Word Count Metric")
+        plt.ylabel("Absolute Prediction Error Mapping")
+        plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "error_vs_length.png"), dpi=300, bbox_inches="tight")
+        plt.close()
+
+    # 6. Interpretability Engineering and Figure 2 (SHAP Plots Execution)
+    print("\nExtracting Explainable AI matrices using SHAP Explainer kernels")
     shap_tree_explainer = shap.TreeExplainer(final_production_model)
     sampled_feature_subset = X_fully_fused_features[:300]
     calculated_shap_values = shap_tree_explainer.shap_values(sampled_feature_subset)
 
+    plt.figure(figsize=(10, 6))
     shap.summary_plot(calculated_shap_values, sampled_feature_subset, show=False)
-    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "shap_summary.png"))
+    plt.title("SHAP Feature Importance Summary Profile", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "shap_summary.png"), dpi=300, bbox_inches="tight")
     plt.close()
 
-    draw_structural_architecture()
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(calculated_shap_values, sampled_feature_subset, plot_type="bar", show=False)
+    plt.title("SHAP Feature Absolute Contributions Chart", fontsize=14)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PipelineConfig.OUTPUT_DIR, "shap_importance.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # Execute remaining deep investigation studies
     execute_prompt_wise_lopo(df_normalized, linguistic_matrix, tokenizer, encoder_model)
     execute_ablation_study(df_normalized, linguistic_matrix, tokenizer, encoder_model)
-    print("Master pipeline operational execution finished successfully.")
+    print("\nMaster pipeline operational execution finished successfully. All journal reference figures generated.")
 
 if __name__ == "__main__":
     import torch.multiprocessing as mp
